@@ -1,10 +1,14 @@
+from datetime import datetime
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
+from typing import Union, Dict
+from pymongo import MongoClient
 import pandas as pd
 import numpy as np
 import joblib
 import xgboost as xgb
 from fastapi.middleware.cors import CORSMiddleware
+from .kafka_producer import send_to_kafka
 
 # ---------- INIT ----------
 app = FastAPI()
@@ -17,22 +21,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------- MODEL LOADING ----------
-# 1. Prophet Sales Forecasting Model
-prophet_model = joblib.load("models/prophet_sales_model.pkl")
+# ---------- MONGO DB ----------
+client = MongoClient("mongodb://localhost:27017/")
+db = client["retail_ai_db"]
+forecast_collection = db["forecast_results"]
+pricing_collection = db["pricing_results"]
+segment_collection = db["segment_results"]
 
-# 2. XGBoost Pricing Model
+# ---------- MODEL LOADING ----------
+prophet_model = joblib.load("models/prophet_sales_model.pkl")
 xgb_model = joblib.load("models/xgb_pricing_model.joblib")
 xgb_encoders = joblib.load("models/label_encoders.pkl")
-
-kmeans_pipeline = joblib.load("models/kmeans_customer_pipeline.joblib")  # adjust path if needed
-
+kmeans_pipeline = joblib.load("models/kmeans_customer_pipeline.joblib")
 
 # ---------- SCHEMAS ----------
 class ForecastRequest(BaseModel):
+    shop_id: str
     periods: int = 30
 
 class PricingInput(BaseModel):
+    shop_id: str
     Product_ID: str
     Brand: str
     Category: str
@@ -47,29 +55,27 @@ class PricingInput(BaseModel):
     Inventory_Level: int
 
 class CustomerInput(BaseModel):
+    shop_id: str
     Age: int
-    Gender: int
-    Marital_Status: int
-    Region: int
+    Gender: str
+    Marital_Status: str
+    Region: str
     Loyalty_Score: float
     Frequency: int
     Recency: int
     Discount_Response_Rate: float
     Average_Basket_Value: float
     Annual_Expenditure: float
-    Customer_Type: int
-    Channel_Preference: int
+    Customer_Type: str
+    Channel_Preference: str
     Tenure_Years: float
     Returns_Rate: float
     Satisfaction_Score: int
-    Category_Pref: int
+    Category_Pref: str
 
-CLUSTER_LABELS = {
-    -1: "Outlier / Unclustered",
-    0: "High-value Repeat Customer",
-    1: "Occasional Discount Seeker",
-    2: "Low-engagement Shopper"
-}
+class KafkaRequest(BaseModel):
+    topic: str
+    message: Union[str, Dict]
 
 # ---------- ROUTES ----------
 @app.get("/")
@@ -80,19 +86,25 @@ def root():
 def forecast(request: ForecastRequest):
     future = prophet_model.make_future_dataframe(periods=request.periods)
     forecast = prophet_model.predict(future)
-    return forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(request.periods).to_dict(orient="records")
+    result = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(request.periods).to_dict(orient="records")
+
+    forecast_collection.insert_one({
+        "shop_id": request.shop_id,
+        "timestamp": datetime.utcnow(),
+        "input": request.dict(),
+        "output": result
+    })
+
+    return result
 
 @app.post("/optimize-price")
 def optimize_price(data: PricingInput):
-    df = pd.DataFrame([data.dict(by_alias=True)])
+    df = pd.DataFrame([data.dict(by_alias=True, exclude={"shop_id"})])
 
-    # Label encode safely
     for col in xgb_encoders:
         value = df[col].iloc[0]
         if value not in xgb_encoders[col].classes_:
-            return {
-                "error": f"Invalid value for '{col}': '{value}' not seen during training."
-            }
+            return {"error": f"Invalid value for '{col}': '{value}' not seen during training."}
         df[col] = xgb_encoders[col].transform(df[col])
 
     df["Discount_%"] = df["Discount_percent"]
@@ -112,15 +124,23 @@ def optimize_price(data: PricingInput):
     units = float(np.expm1(prediction[0]))
     revenue = float(df["Price_INR"].iloc[0] * units)
 
-    return {
+    result = {
         "Units_Predicted": round(units, 2),
         "Expected_Revenue": round(revenue, 2)
     }
+
+    pricing_collection.insert_one({
+        "shop_id": data.shop_id,
+        "timestamp": datetime.utcnow(),
+        "input": data.dict(by_alias=True, exclude={"shop_id"}),
+        "output": result
+    })
+
+    return result
 @app.post("/segment")
 def segment_customer(data: CustomerInput):
-    df = pd.DataFrame([data.dict()])
+    df = pd.DataFrame([data.dict(exclude={"shop_id"})])
 
-    # Cast categorical columns to string for OneHotEncoder compatibility
     categorical_cols = [
         "Gender", "Marital_Status", "Region",
         "Customer_Type", "Channel_Preference", "Category_Pref"
@@ -128,16 +148,44 @@ def segment_customer(data: CustomerInput):
     for col in categorical_cols:
         df[col] = df[col].astype(str)
 
-    # Predict cluster
     cluster = kmeans_pipeline.predict(df)[0]
 
+    # ✅ Corrected Cluster-to-Segment Mapping (Based on MongoDB Analysis)
     CLUSTER_LABELS_KMEANS = {
         0: "Value-Focused Shoppers",
-        1: "High-Spending Loyal Customers",
-        2: "Occasional Deal Seekers"
+        1: "Occasional Deal Seekers",
+        2: "High-Spending Loyal Customers"
     }
 
-    return {
+    result = {
         "cluster_label": int(cluster),
         "segment": CLUSTER_LABELS_KMEANS.get(cluster, f"Cluster {cluster}")
     }
+
+    # ⏺️ Save result to MongoDB
+    segment_collection.insert_one({
+        "shop_id": data.shop_id,
+        "timestamp": datetime.utcnow(),
+        "input": data.dict(exclude={"shop_id"}),
+        "output": result
+    })
+
+    return result
+
+
+@app.post("/send-kafka/")
+def send_kafka_data(data: KafkaRequest):
+    send_to_kafka(data.topic, data.message)
+    return {"status": "Message sent to Kafka"}
+
+@app.get("/records/forecast")
+def get_forecast_records():
+    return list(forecast_collection.find({}, {"_id": 0}))
+
+@app.get("/records/pricing")
+def get_pricing_records():
+    return list(pricing_collection.find({}, {"_id": 0}))
+
+@app.get("/records/segment")
+def get_segment_records():
+    return list(segment_collection.find({}, {"_id": 0}))
